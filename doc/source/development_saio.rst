@@ -650,6 +650,16 @@ be found in the ``etc\saio`` directory.
 
         [object-auditor]
 
+  #. Create `/etc/swift/swift.conf`::
+
+        PRE=`python -c 'import uuid; print uuid.uuid4().hex'`
+        SUFF=`python -c 'import uuid; print uuid.uuid4().hex'`
+        cat <<EOF >/etc/swift/swift.conf
+        [swift-hash]
+        # random unique strings that can never change (DO NOT LOSE)
+        swift_hash_path_suffix = $PRE
+        swift_hash_path_suffix = $SUFF
+        EOF
 
 ------------------------------------
 Setting up scripts for running Swift
