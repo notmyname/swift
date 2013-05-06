@@ -21,6 +21,7 @@ import errno
 import os
 import time
 import traceback
+from collections import defaultdict
 from datetime import datetime
 from hashlib import md5
 from tempfile import mkstemp
@@ -28,18 +29,19 @@ from urllib import unquote
 from contextlib import contextmanager
 
 from xattr import getxattr, setxattr
-from eventlet import sleep, Timeout, tpool
+from eventlet import sleep, Timeout
 
 from swift.common.utils import mkdirs, normalize_timestamp, public, \
     storage_directory, hash_path, renamer, fallocate, fsync, fdatasync, \
     split_path, drop_buffer_cache, get_logger, write_pickle, \
-    config_true_value, validate_device_partition, timing_stats
+    config_true_value, validate_device_partition, timing_stats, \
+    ThreadPool
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, check_mount, \
     check_float, check_utf8
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     DiskFileNotExist, DiskFileCollision, DiskFileNoSpace
-from swift.obj.replicator import tpool_reraise, invalidate_hash, \
+from swift.obj.replicator import invalidate_hash, \
     quarantine_renamer, get_hashes
 from swift.common.http import is_success
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
@@ -105,12 +107,14 @@ class DiskFile(object):
     :param keep_data_fp: if True, don't close the fp, otherwise close it
     :param disk_chunk_size: size of chunks on file reads
     :param iter_hook: called when __iter__ returns a chunk
+    :param threadpool: thread pool in which to do blocking operations
+
     :raises DiskFileCollision: on md5 collision
     """
 
     def __init__(self, path, device, partition, account, container, obj,
                  logger, keep_data_fp=False, disk_chunk_size=65536,
-                 iter_hook=None):
+                 iter_hook=None, threadpool=None):
         self.disk_chunk_size = disk_chunk_size
         self.iter_hook = iter_hook
         self.name = '/' + '/'.join((account, container, obj))
@@ -131,6 +135,7 @@ class DiskFile(object):
         self.quarantined_dir = None
         self.keep_cache = False
         self.suppress_file_closing = False
+        self.threadpool = threadpool or ThreadPool(nthreads=0)
         if not os.path.exists(self.datadir):
             return
         files = sorted(os.listdir(self.datadir), reverse=True)
@@ -176,7 +181,8 @@ class DiskFile(object):
                 self.started_at_0 = True
                 self.iter_etag = md5()
             while True:
-                chunk = self.fp.read(self.disk_chunk_size)
+                chunk = self.threadpool.run_in_thread(
+                    self.fp.read, self.disk_chunk_size)
                 if chunk:
                     if self.iter_etag:
                         self.iter_etag.update(chunk)
@@ -326,22 +332,24 @@ class DiskFile(object):
         assert self.tmppath is not None
         metadata['name'] = self.name
         timestamp = normalize_timestamp(metadata['X-Timestamp'])
-        # Write the metadata before calling fsync() so that both data and
-        # metadata are flushed to disk.
-        write_metadata(fd, metadata)
-        # We call fsync() before calling drop_cache() to lower the amount of
-        # redundant work the drop cache code will perform on the pages (now
-        # that after fsync the pages will be all clean).
-        tpool.execute(fsync, fd)
-        # From the Department of the Redundancy Department, make sure we
-        # call drop_cache() after fsync() to avoid redundant work (pages
-        # all clean).
-        self.drop_cache(fd, 0, fsize)
-        invalidate_hash(os.path.dirname(self.datadir))
-        # After the rename completes, this object will be available for other
-        # requests to reference.
-        renamer(self.tmppath,
-                os.path.join(self.datadir, timestamp + extension))
+
+        def finalize_put():
+            # Write the metadata before calling fsync() so that both data and
+            # metadata are flushed to disk.
+            write_metadata(fd, metadata)
+            # We call fsync() before calling drop_cache() to lower the amount
+            # of redundant work the drop cache code will perform on the pages
+            # (now that after fsync the pages will be all clean).
+            fsync(fd)
+            # From the Department of the Redundancy Department, make sure
+            # we call drop_cache() after fsync() to avoid redundant work
+            # (pages all clean).
+            self.drop_cache(fd, 0, fsize)
+            invalidate_hash(os.path.dirname(self.datadir))
+            renamer(self.tmppath,
+                    os.path.join(self.datadir, timestamp + extension))
+
+        self.threadpool.force_run_in_thread(finalize_put)
         self.metadata = metadata
 
     def put_metadata(self, metadata, tombstone=False):
@@ -366,7 +374,9 @@ class DiskFile(object):
         for fname in os.listdir(self.datadir):
             if fname < timestamp:
                 try:
-                    os.unlink(os.path.join(self.datadir, fname))
+                    self.threadpool.run_in_thread(
+                        os.unlink,
+                        os.path.join(self.datadir, fname))
                 except OSError, err:    # pragma: no cover
                     if err.errno != errno.ENOENT:
                         raise
@@ -385,8 +395,8 @@ class DiskFile(object):
                   directory otherwise None
         """
         if not (self.is_deleted() or self.quarantined_dir):
-            self.quarantined_dir = quarantine_renamer(self.device_path,
-                                                      self.data_file)
+            self.quarantined_dir = self.threadpool.run_in_thread(
+                quarantine_renamer, self.device_path, self.data_file)
             self.logger.increment('quarantines')
             return self.quarantined_dir
 
@@ -403,7 +413,8 @@ class DiskFile(object):
         try:
             file_size = 0
             if self.data_file:
-                file_size = os.path.getsize(self.data_file)
+                file_size = self.threadpool.run_in_thread(
+                    os.path.getsize, self.data_file)
                 if 'Content-Length' in self.metadata:
                     metadata_size = int(self.metadata['Content-Length'])
                     if file_size != metadata_size:
@@ -441,6 +452,9 @@ class ObjectController(object):
         self.max_upload_time = int(conf.get('max_upload_time', 86400))
         self.slow = int(conf.get('slow', 0))
         self.bytes_per_sync = int(conf.get('mb_per_sync', 512)) * 1024 * 1024
+        self.threads_per_disk = int(conf.get('threads_per_disk', '0'))
+        self.threadpools = defaultdict(
+            lambda: ThreadPool(nthreads=self.threads_per_disk))
         default_allowed_headers = '''
             content-disposition,
             content-encoding,
@@ -501,7 +515,8 @@ class ObjectController(object):
         async_dir = os.path.join(self.devices, objdevice, ASYNCDIR)
         ohash = hash_path(account, container, obj)
         self.logger.increment('async_pendings')
-        write_pickle(
+        self.threadpools[objdevice].run_in_thread(
+            write_pickle,
             {'op': op, 'account': account, 'container': container,
              'obj': obj, 'headers': headers_out},
             os.path.join(async_dir, ohash[-3:], ohash + '-' +
@@ -615,8 +630,8 @@ class ObjectController(object):
             return HTTPInsufficientStorage(drive=device, request=request)
         disk_file = DiskFile(self.devices, device, partition, account,
                              container, obj, self.logger,
-                             disk_chunk_size=self.disk_chunk_size)
-
+                             disk_chunk_size=self.disk_chunk_size,
+                             threadpool=self.threadpools[device])
         if disk_file.is_deleted() or disk_file.is_expired():
             return HTTPNotFound(request=request)
         try:
@@ -668,7 +683,8 @@ class ObjectController(object):
                                   content_type='text/plain')
         disk_file = DiskFile(self.devices, device, partition, account,
                              container, obj, self.logger,
-                             disk_chunk_size=self.disk_chunk_size)
+                             disk_chunk_size=self.disk_chunk_size,
+                             threadpool=self.threadpools[device])
         orig_timestamp = disk_file.metadata.get('X-Timestamp')
         upload_expiration = time.time() + self.max_upload_time
         etag = md5()
@@ -693,7 +709,8 @@ class ObjectController(object):
                         chunk = chunk[written:]
                     # For large files sync every 512MB (by default) written
                     if upload_size - last_sync >= self.bytes_per_sync:
-                        tpool.execute(fdatasync, fd)
+                        self.threadpools[device].force_run_in_thread(
+                            fdatasync, fd)
                         drop_buffer_cache(fd, last_sync,
                                           upload_size - last_sync)
                         last_sync = upload_size
@@ -766,7 +783,8 @@ class ObjectController(object):
         disk_file = DiskFile(self.devices, device, partition, account,
                              container, obj, self.logger, keep_data_fp=True,
                              disk_chunk_size=self.disk_chunk_size,
-                             iter_hook=sleep)
+                             iter_hook=sleep,
+                             threadpool=self.threadpools[device])
         if disk_file.is_deleted() or disk_file.is_expired():
             if request.headers.get('if-match') == '*':
                 return HTTPPreconditionFailed(request=request)
@@ -847,7 +865,8 @@ class ObjectController(object):
             return HTTPInsufficientStorage(drive=device, request=request)
         disk_file = DiskFile(self.devices, device, partition, account,
                              container, obj, self.logger,
-                             disk_chunk_size=self.disk_chunk_size)
+                             disk_chunk_size=self.disk_chunk_size,
+                             threadpool=self.threadpools[device])
         if disk_file.is_deleted() or disk_file.is_expired():
             return HTTPNotFound(request=request)
         try:
@@ -891,7 +910,8 @@ class ObjectController(object):
         response_class = HTTPNoContent
         disk_file = DiskFile(self.devices, device, partition, account,
                              container, obj, self.logger,
-                             disk_chunk_size=self.disk_chunk_size)
+                             disk_chunk_size=self.disk_chunk_size,
+                             threadpool=self.threadpools[device])
         if 'x-if-delete-at' in request.headers and \
                 int(request.headers['x-if-delete-at']) != \
                 int(disk_file.metadata.get('X-Delete-At') or 0):
@@ -940,7 +960,8 @@ class ObjectController(object):
         if not os.path.exists(path):
             mkdirs(path)
         suffixes = suffix.split('-') if suffix else []
-        _junk, hashes = tpool_reraise(get_hashes, path, recalculate=suffixes)
+        _junk, hashes = self.threadpools[device].force_run_in_thread(
+            get_hashes, path, recalculate=suffixes)
         return Response(body=pickle.dumps(hashes))
 
     def __call__(self, env, start_response):

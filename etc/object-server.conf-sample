@@ -63,6 +63,8 @@ use = egg:swift#object
 # allowed_headers = Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object
 # auto_create_account_prefix = .
 # max_clients = 1024
+# A value of 0 means "don't use thread pools"
+# threads_per_disk = 0
 
 [filter:healthcheck]
 use = egg:swift#healthcheck
