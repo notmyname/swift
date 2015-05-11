@@ -12,11 +12,12 @@
 # limitations under the License.
 
 from ConfigParser import ConfigParser
-import textwrap
+import os
 import string
+import textwrap
 
 from swift.common.utils import config_true_value, SWIFT_CONF_FILE
-from swift.common.ring import Ring
+from swift.common.ring import Ring, RingData
 from swift.common.utils import quorum_size
 from swift.common.exceptions import RingValidationError
 from pyeclib.ec_iface import ECDriver, ECDriverError, VALID_EC_TYPES
@@ -28,6 +29,52 @@ DEFAULT_POLICY_TYPE = REPL_POLICY = 'replication'
 EC_POLICY = 'erasure_coding'
 
 DEFAULT_EC_OBJECT_SEGMENT_SIZE = 1048576
+
+
+def all_bind_ports_for_node(swift_dir, my_ips, mtimes_by_ring_name):
+    """
+    Given a swift_dir, an iterable of IP addresses identifying a storage
+    backend server, and an mtime-caching dictionary, return a set of all bind
+    ports defined in all rings for this storage backend server.
+
+    If no rings have changed, according to the cached mtimes in
+    mtimes_by_ring_name, then None is returned.
+
+    The caller is responsible for not calling this function (which performs at
+    least a stat on all ring files) too frequently.
+    """
+    my_ips = set(my_ips)
+    any_ring_changed = False
+    ring_paths = set()
+    for policy in POLICIES:
+        # NOTE: we must NOT use policy.load_ring to load the ring.  Users of
+        # this utility function will not need the actual ring data, just the
+        # bind ports.
+        #
+        # This is duplicated with Ring.__init__ just a bit...
+        serialized_path = os.path.join(swift_dir,
+                                       policy.ring_name + '.ring.gz')
+        ring_paths.add(serialized_path)
+        new_mtime = os.path.getmtime(serialized_path)
+        old_mtime = mtimes_by_ring_name.get(policy.ring_name)
+        if not old_mtime or old_mtime != new_mtime:
+            any_ring_changed = True
+            mtimes_by_ring_name[policy.ring_name] = new_mtime
+            # No "break" here so all rings will be in ring_paths and
+            # mtimes_by_ring_name will get fully updated (if at more than one
+            # ring has a newer mtime).
+
+    if not any_ring_changed:
+        return None
+
+    bind_ports = set()
+    for ring_path in ring_paths:
+        devs = RingData.load_devices(ring_path)
+        bind_ports = bind_ports.union(set(
+            dev['port'] for dev in devs
+            if dev and dev['ip'] in my_ips))
+
+    return bind_ports
 
 
 class PolicyError(ValueError):

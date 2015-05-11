@@ -120,7 +120,10 @@ class ObjectReconstructor(Daemon):
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.bind_ip = conf.get('bind_ip', '0.0.0.0')
-        self.port = int(conf.get('bind_port', 6000))
+        self.server_per_port = config_true_value(conf.get('server_per_port',
+                                                          'false'))
+        self.port = None if self.server_per_port else \
+            int(conf.get('bind_port', 6000))
         self.concurrency = int(conf.get('concurrency', 1))
         self.stats_interval = int(conf.get('stats_interval', '300'))
         self.ring_check_interval = int(conf.get('ring_check_interval', 15))
@@ -773,6 +776,7 @@ class ObjectReconstructor(Daemon):
                     ips, self.port,
                     dev['replication_ip'], dev['replication_port']),
                 policy.object_ring.devs)
+
             for local_dev in local_devices:
                 if override_devices and (local_dev['device'] not in
                                          override_devices):

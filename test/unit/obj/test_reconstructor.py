@@ -73,8 +73,7 @@ def make_ec_archive_bodies(policy, test_body):
         fragment_payloads.append(fragments)
 
     # join up the fragment payloads per node
-    ec_archive_bodies = [''.join(fragments)
-                         for fragments in zip(*fragment_payloads)]
+    ec_archive_bodies = [''.join(frags) for frags in zip(*fragment_payloads)]
     return ec_archive_bodies
 
 
@@ -577,7 +576,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                         except AssertionError as e:
                             extra_info = \
                                 '\n\n... for %r in part num %s job %r' % (
-                                k, part_num, job_key)
+                                    k, part_num, job_key)
                             raise AssertionError(str(e) + extra_info)
                 else:
                     self.fail(
@@ -996,6 +995,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def setUp(self):
         self.policy = POLICIES.default
+        self.policy.object_ring._rtime = time.time() + 3600
         self.testdir = tempfile.mkdtemp()
         self.devices = os.path.join(self.testdir, 'devices')
         self.local_dev = self.policy.object_ring.devs[0]
@@ -1008,13 +1008,7 @@ class TestObjectReconstructor(unittest.TestCase):
             'bind_port': self.port,
         }
         self.logger = debug_logger('object-reconstructor')
-        self.reconstructor = object_reconstructor.ObjectReconstructor(
-            self.conf, logger=self.logger)
-        self.reconstructor._reset_stats()
-        # some tests bypass build_reconstruction_jobs and go to process_job
-        # directly, so you end up with a /0 when you try to show the
-        # percentage of complete jobs as ratio of the total job count
-        self.reconstructor.job_count = 1
+        self._create_reconstructor()
         self.policy.object_ring.max_more_nodes = \
             self.policy.object_ring.replicas
         self.ts_iter = make_timestamp_iter()
@@ -1025,6 +1019,15 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def ts(self):
         return next(self.ts_iter)
+
+    def _create_reconstructor(self):
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.reconstructor._reset_stats()
+        # some tests bypass build_reconstruction_jobs and go to process_job
+        # directly, so you end up with a /0 when you try to show the
+        # percentage of complete jobs as ratio of the total job count
+        self.reconstructor.job_count = 1
 
     def test_collect_parts_skips_non_ec_policy_and_device(self):
         stub_parts = (371, 78, 419, 834)
@@ -1046,10 +1049,117 @@ class TestObjectReconstructor(unittest.TestCase):
                                           diskfile.get_data_dir(self.policy),
                                           str(part_info['partition'])))
 
+    def test_collect_parts_skips_non_local_devs_one_server_per_port(self):
+        self.conf = {
+            'devices': self.devices,
+            'mount_check': False,
+            'bind_ip': self.ip,
+            'bind_port': self.port,
+            'server_per_port': True,
+        }
+        self._create_reconstructor()
+
+        device_parts = {
+            'sda': (374,),
+            'sdb': (179, 807),  # w/one-serv-per-port, same IP alone is local
+            'sdc': (363, 468, 843),
+            'sdd': (912,),  # "not local" via different IP
+        }
+        for policy in POLICIES:
+            datadir = diskfile.get_data_dir(policy)
+            for dev, parts in device_parts.items():
+                for part in parts:
+                    utils.mkdirs(os.path.join(
+                        self.devices, dev,
+                        datadir, str(part)))
+
+        # we're only going to add sda and sdc into the ring
+        local_devs = ('sda', 'sdb', 'sdc')
+        stub_ring_devs = [{
+            'device': dev,
+            'replication_ip': self.ip,
+            'replication_port': self.port + 1 if dev == 'sdb' else self.port,
+        } for dev in local_devs]
+        stub_ring_devs.append({
+            'device': 'sdd',
+            'replication_ip': '127.0.0.88',  # not local via IP
+            'replication_port': self.port,
+        })
+        self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
+        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
+                               return_value=[self.ip]),
+                    mock.patch.object(self.policy.object_ring, '_devs',
+                                      new=stub_ring_devs)):
+            part_infos = list(self.reconstructor.collect_parts())
+        found_parts = sorted(int(p['partition']) for p in part_infos)
+        expected_parts = sorted(itertools.chain(
+            *(device_parts[d] for d in local_devs)))
+        self.assertEqual(found_parts, expected_parts)
+        for part_info in part_infos:
+            self.assertEqual(part_info['policy'], self.policy)
+            self.assertTrue(part_info['local_dev'] in stub_ring_devs)
+            dev = part_info['local_dev']
+            self.assertEqual(part_info['part_path'],
+                             os.path.join(self.devices,
+                                          dev['device'],
+                                          diskfile.get_data_dir(self.policy),
+                                          str(part_info['partition'])))
+
+    def test_collect_parts_multi_device_skips_non_non_local_devs(self):
+        device_parts = {
+            'sda': (374,),
+            'sdb': (179, 807),  # "not local" via different port
+            'sdc': (363, 468, 843),
+            'sdd': (912,),  # "not local" via different IP
+        }
+        for policy in POLICIES:
+            datadir = diskfile.get_data_dir(policy)
+            for dev, parts in device_parts.items():
+                for part in parts:
+                    utils.mkdirs(os.path.join(
+                        self.devices, dev,
+                        datadir, str(part)))
+
+        # we're only going to add sda and sdc into the ring
+        local_devs = ('sda', 'sdc')
+        stub_ring_devs = [{
+            'device': dev,
+            'replication_ip': self.ip,
+            'replication_port': self.port,
+        } for dev in local_devs]
+        stub_ring_devs.append({
+            'device': 'sdb',
+            'replication_ip': self.ip,
+            'replication_port': self.port + 1,  # not local via port
+        })
+        stub_ring_devs.append({
+            'device': 'sdd',
+            'replication_ip': '127.0.0.88',  # not local via IP
+            'replication_port': self.port,
+        })
+        self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
+        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
+                               return_value=[self.ip]),
+                    mock.patch.object(self.policy.object_ring, '_devs',
+                                      new=stub_ring_devs)):
+            part_infos = list(self.reconstructor.collect_parts())
+        found_parts = sorted(int(p['partition']) for p in part_infos)
+        expected_parts = sorted(itertools.chain(
+            *(device_parts[d] for d in local_devs)))
+        self.assertEqual(found_parts, expected_parts)
+        for part_info in part_infos:
+            self.assertEqual(part_info['policy'], self.policy)
+            self.assertTrue(part_info['local_dev'] in stub_ring_devs)
+            dev = part_info['local_dev']
+            self.assertEqual(part_info['part_path'],
+                             os.path.join(self.devices,
+                                          dev['device'],
+                                          diskfile.get_data_dir(self.policy),
+                                          str(part_info['partition'])))
+
     def test_collect_parts_multi_device_skips_non_ring_devices(self):
         device_parts = {
             'sda': (374,),
-            'sdb': (179, 807),
             'sdc': (363, 468, 843),
         }
         for policy in POLICIES:
@@ -1065,7 +1175,7 @@ class TestObjectReconstructor(unittest.TestCase):
         stub_ring_devs = [{
             'device': dev,
             'replication_ip': self.ip,
-            'replication_port': self.port
+            'replication_port': self.port,
         } for dev in local_devs]
         self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
         with nested(mock.patch('swift.obj.reconstructor.whataremyips',

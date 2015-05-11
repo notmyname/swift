@@ -142,22 +142,35 @@ def kill_nonprimary_server(primary_nodes, ipport2server, pids):
             return ipport
 
 
-def build_port_to_conf(server):
-    # map server to config by port
-    port_to_config = {}
-    for server_ in Manager([server]):
-        for config_path in server_.conf_files():
-            conf = readconf(config_path,
-                            section_name='%s-replicator' % server_.type)
-            port_to_config[int(conf['bind_port'])] = conf
-    return port_to_config
+def add_ring_devs_to_ipport2server(ring, server_type, ipport2server):
+    # We'll number the servers by order of unique occurrence of ip
+    # within the ring devices.
+    ips_to_number = {}
+    number = 0
+    for dev in filter(None, ring.devs):
+        ip = dev['ip']
+        ipport = (ip, dev['port'])
+        if ip not in ips_to_number:
+            number += 1
+            ips_to_number[ip] = number
+        ipport2server[ipport] = '%s%d' % (server_type, ips_to_number[ip])
+
+
+def store_config_paths(name, configs):
+    for server_name in (name, '%s-replicator' % name):
+        for server in Manager([server_name]):
+            for i, conf in enumerate(server.conf_files(), 1):
+                configs[server.server][i] = conf
 
 
 def get_ring(ring_name, required_replicas, required_devices,
-             server=None, force_validate=None):
+             server=None, force_validate=None, ipport2server=None):
     if not server:
         server = ring_name
     ring = Ring('/etc/swift', ring_name=ring_name)
+    if ipport2server is None:
+        ipport2server = {}  # used internally, even if not passed in
+    add_ring_devs_to_ipport2server(ring, server, ipport2server)
     if not VALIDATE_RSYNC and not force_validate:
         return ring
     # easy sanity checks
@@ -167,10 +180,16 @@ def get_ring(ring_name, required_replicas, required_devices,
     if len(ring.devs) != required_devices:
         raise SkipTest('%s has %s devices instead of %s' % (
             ring.serialized_path, len(ring.devs), required_devices))
-    port_to_config = build_port_to_conf(server)
+    config_paths = defaultdict(dict)
+    store_config_paths(server, config_paths)
+    repl_name = '%s-replicator' % server
+    repl_configs = {i: readconf(c, section_name=repl_name)
+                    for i, c in config_paths[repl_name].iteritems()}
     for dev in ring.devs:
         # verify server is exposing mounted device
-        conf = port_to_config[dev['port']]
+        ipport = (dev['ip'], dev['port'])
+        _, server_number = get_server_number(ipport, ipport2server)
+        conf = repl_configs[server_number]
         for device in os.listdir(conf['devices']):
             if device == dev['device']:
                 dev_path = os.path.join(conf['devices'], device)
@@ -185,7 +204,7 @@ def get_ring(ring_name, required_replicas, required_devices,
                 "unable to find ring device %s under %s's devices (%s)" % (
                     dev['device'], server, conf['devices']))
         # verify server is exposing rsync device
-        if port_to_config[dev['port']].get('vm_test_mode', False):
+        if conf.get('vm_test_mode', False):
             rsync_export = '%s%s' % (server, dev['replication_port'])
         else:
             rsync_export = server
@@ -239,21 +258,27 @@ class ProbeTest(unittest.TestCase):
             self.account_ring = get_ring(
                 'account',
                 self.acct_cont_required_replicas,
-                self.acct_cont_required_devices)
-            self._add_ring_devs_to_ipport2server(self.account_ring, 'account')
+                self.acct_cont_required_devices,
+                ipport2server=self.ipport2server)
             self.container_ring = get_ring(
                 'container',
                 self.acct_cont_required_replicas,
-                self.acct_cont_required_devices)
-            self._add_ring_devs_to_ipport2server(self.container_ring,
-                                                 'container')
+                self.acct_cont_required_devices,
+                ipport2server=self.ipport2server)
             self.policy = get_policy(**self.policy_requirements)
             self.object_ring = get_ring(
                 self.policy.ring_name,
                 self.obj_required_replicas,
                 self.obj_required_devices,
-                server='object')
-            self._add_ring_devs_to_ipport2server(self.object_ring, 'object')
+                server='object',
+                ipport2server=self.ipport2server)
+
+            # Determine if the rings have different IPs per "server" (this
+            # allows IP to fully differentiate "servers", otherwise port must
+            # be used which doesn't work with a one-server-per-port setup).
+            self.unique_ips_in_rings = len(set(ipport[0] for ipport in
+                                               self.ipport2server)) != 1
+
             Manager(['main']).start(wait=False)
             for ipport in self.ipport2server:
                 check_server(ipport, self.ipport2server, self.pids)
@@ -263,18 +288,11 @@ class ProbeTest(unittest.TestCase):
                 proxy_ipport, self.ipport2server, self.pids)
             self.configs = defaultdict(dict)
             for name in ('account', 'container', 'object'):
-                for server_name in (name, '%s-replicator' % name):
-                    for server in Manager([server_name]):
-                        for i, conf in enumerate(server.conf_files(), 1):
-                            self.configs[server.server][i] = conf
+                store_config_paths(name, self.configs)
             self.replicators = Manager(
                 ['account-replicator', 'container-replicator',
                  'object-replicator'])
             self.updaters = Manager(['container-updater', 'object-updater'])
-            self.server_port_to_conf = {}
-            # get some configs backend daemon configs loaded up
-            for server in ('account', 'container', 'object'):
-                self.server_port_to_conf[server] = build_port_to_conf(server)
         except BaseException:
             try:
                 raise
@@ -287,21 +305,12 @@ class ProbeTest(unittest.TestCase):
     def tearDown(self):
         Manager(['all']).kill()
 
-    def _add_ring_devs_to_ipport2server(self, ring, server_type):
-        # We'll number the servers by order of unique occurrence of (ip, port)
-        # tuples within the ring devices.
-        ipports_to_number = {}
-        number = 0
-        for dev in filter(None, ring.devs):
-            ipport = (dev['ip'], dev['port'])
-            if ipport not in ipports_to_number:
-                number += 1
-                ipports_to_number[ipport] = number
-            self.ipport2server[ipport] = '%s%d' % (server_type,
-                                                   ipports_to_number[ipport])
-
     def device_dir(self, server, node):
-        conf = self.server_port_to_conf[server][node['port']]
+        server_type, config_number = get_server_number(
+            (node['ip'], node['port']), self.ipport2server)
+        repl_server = '%s-replicator' % server_type
+        conf = readconf(self.configs[repl_server][config_number],
+                        section_name=repl_server)
         return os.path.join(conf['devices'], node['device'])
 
     def storage_dir(self, server, node, part=None, policy=None):
@@ -316,6 +325,21 @@ class ProbeTest(unittest.TestCase):
         _server_type, config_number = get_server_number(
             (node['ip'], node['port']), self.ipport2server)
         return config_number
+
+    def is_local_to(self, node1, node2):
+        """
+        Return True if both ring devices are "local" to each other (on the same
+        "server".
+        """
+        if self.unique_ips_in_rings:
+            return node1['ip'] == node2['ip']
+
+        # Without a disambiguating IP, for SAIOs, we have to assume ports
+        # uniquely identify "servers".  SAIOs should be configured to *either*
+        # have unique IPs per node (e.g. 127.0.0.1, 127.0.0.2, etc.) OR unique
+        # ports per server (i.e. sdb1 & sdb5 would have same port numbers in
+        # the 8-disk EC ring).
+        return node1['port'] == node2['port']
 
     def get_to_final_state(self):
         # these .stop()s are probably not strictly necessary,

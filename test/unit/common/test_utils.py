@@ -1737,6 +1737,21 @@ log_name = %(yarr)s'''
         for func in required_func_calls:
             self.assert_(utils.os.called_funcs[func])
 
+    def test_drop_privileges_no_setsid(self):
+        user = getuser()
+        # over-ride os with mock
+        required_func_calls = ('setgroups', 'setgid', 'setuid', 'chdir',
+                               'umask')
+        bad_func_calls = ('setsid',)
+        utils.os = MockOs(called_funcs=required_func_calls,
+                          raise_funcs=bad_func_calls)
+        # exercise the code
+        utils.drop_privileges(user, no_setsid=True)
+        for func in required_func_calls:
+            self.assert_(utils.os.called_funcs[func])
+        for func in bad_func_calls:
+            self.assert_(func not in utils.os.called_funcs)
+
     @reset_logger_state
     def test_capture_stdio(self):
         # stubs
