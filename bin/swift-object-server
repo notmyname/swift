@@ -14,14 +14,200 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from eventlet import greenio, sleep
+import os
+import signal
 import sys
-from swift.common.utils import parse_options
-from swift.common.wsgi import run_wsgi
+from swift.common import utils
+from swift.common.storage_policy import all_bind_ports_for_node
+from swift.common.utils import (
+    parse_options, capture_stdio, drop_privileges, config_true_value,
+    whataremyips)
+from swift.common.wsgi import (
+    run_wsgi, get_socket, loadapp, run_server, appconfig, ConfigFileError,
+    _initrp)
 from swift.obj import server
+import time
+
+
+def run_wsgi_one_server_per_disk(conf_path, app_section, *args, **kwargs):
+    """
+    Runs the object-server using one child worker process per unique device
+    port across all storage polices' rings.
+
+    :param conf_path: Path to paste.deploy style configuration file/directory
+    :param app_section: App name from conf file to load config from
+    :returns: 0 if successful, nonzero otherwise
+    """
+    # Load configuration, set logger and Load request processor
+    try:
+        (conf, logger, log_name) = \
+            _initrp(conf_path, app_section, *args, **kwargs)
+    except ConfigFileError as e:
+        print(e)
+        return 1
+
+    # The normal run_wsgi drops privileges here, which we obviously cannot do
+    # if we want to support binding to low ports.  But we do want some of the
+    # actions that drop_privileges did.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    os.chdir('/')   # in case you need to rmdir on where you started the daemon
+    os.umask(0o22)  # ensure files are created with the correct privileges
+
+    # Ensure the configuration and application can be loaded before proceeding.
+    global_conf = {'log_name': log_name}
+    if 'global_conf_callback' in kwargs:
+        kwargs['global_conf_callback'](conf, global_conf)
+    loadapp(conf_path, global_conf=global_conf)
+
+    # set utils.FALLOCATE_RESERVE if desired
+    reserve = int(conf.get('fallocate_reserve', 0))
+    if reserve > 0:
+        utils.FALLOCATE_RESERVE = reserve
+    # redirect errors to logger and close stdio
+    capture_stdio(logger)
+
+    def kill_children(*args):
+        """Kills the entire process group."""
+        logger.error('SIGTERM received')
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        running[0] = False
+        os.killpg(0, signal.SIGTERM)
+
+    def hup(*args):
+        """
+        Propagate the SIGHUP to children who will shut down /their/ sockets and
+        exit after their current requests complete.
+        """
+        logger.error('SIGHUP received')
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        running[0] = False
+        os.killpg(0, signal.SIGHUP)
+
+    running = [True]
+    signal.signal(signal.SIGTERM, kill_children)
+    signal.signal(signal.SIGHUP, hup)
+
+    swift_dir = conf.get('swift_dir', '/etc/swift')
+    reload_time = 15  # seconds
+    rtime = 0
+    my_ips = set(whataremyips())
+    mtimes_by_ring_name = {}
+    pids_by_port = {}
+    ports_by_pid = {}
+    bind_ports = None
+
+    while running[0]:
+        now = time.time()
+        if now >= rtime:
+            new_bind_ports = all_bind_ports_for_node(swift_dir, my_ips,
+                                                     mtimes_by_ring_name)
+            if new_bind_ports is not None:
+                bind_ports = new_bind_ports
+            rtime = now + reload_time
+
+        old_ports = set(pids_by_port.keys())
+        if bind_ports != old_ports:
+            # Orphan ports are ports which had object-server processes running,
+            # but which no longer appear in the ring.  We'll kill them after we
+            # start missing workers.
+            orphan_ports = old_ports - bind_ports
+
+            # Fork off worker for every port who's supposed to have a worker
+            # but doesn't
+            for port in bind_ports - old_ports:
+                pid = os.fork()
+                if pid == 0:
+                    # child worker process
+                    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    conf['bind_port'] = port
+                    sock = get_socket(conf)
+
+                    def child_hup(*args):
+                        greenio.shutdown_safe(sock)
+                        sock.close()
+                        logger.notice('Closing sock on HUP for port %d',
+                                      port)
+                        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                        # This will exit wsgi.server's main loop,
+                        # allowing the pool.waitall() to happen (graceful
+                        # shutdown)
+                        raise SystemExit()
+
+                    signal.signal(signal.SIGHUP, child_hup)
+
+                    # remaining tasks should not require elevated privileges
+                    drop_privileges(conf.get('user', 'swift'), no_setsid=True)
+                    run_server(conf, logger, sock)
+                    logger.notice('Child %d (port %d) exiting normally',
+                                  os.getpid(), port)
+                    return 0
+                # parent
+                logger.notice('Started child %s for port %d', pid, port)
+                pids_by_port[port] = pid
+                ports_by_pid[pid] = port
+
+            for kill_port in orphan_ports:
+                # The reasoning is that if a device port isn't in the ring any
+                # more, any in-progress request is suspect and letting it
+                # finish may not be best.  So we immediately kill.
+                kill_pid = pids_by_port[kill_port]
+
+                if os.kill(kill_pid, 0):
+                    os.kill(kill_pid, signal.SIGTERM)
+                    # Give it one second to exit
+                    for _ in xrange(10):
+                        pid, _ = os.waitpid(kill_pid, os.WNOHANG)
+                        if not pid:
+                            break
+                        sleep(0.1)  # 10 to a second
+                    else:
+                        # Process didn't exit after a second... try harder?
+                        os.kill(kill_pid, signal.SIGKILL)
+                        os.waitpid(kill_pid, 0)
+
+                del pids_by_port[kill_port]
+                ports_by_pid.pop(kill_pid, None)
+
+            assert bind_ports == set(pids_by_port.keys())
+
+        # Now, we need to notice when a child process dies OR when any ring
+        # mtime changes.  To achieve this, we check for either every so often
+        # (period chosen for acceptable child-restart latency and "busy wait"
+        # CPU usage).
+        sleep(0.5)
+
+        for child_pid in ports_by_pid.keys():
+            pid, status = os.waitpid(child_pid, os.WNOHANG)
+            # non-zero pid means it exited with some status
+            if pid and os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                dead_port = ports_by_pid[pid]
+                logger.error('Removing dead child %s for port %s',
+                             pid, dead_port)
+                del ports_by_pid[pid]
+                pids_by_port.pop(dead_port, None)
+
+    logger.notice('Exited')
+    return 0
 
 
 if __name__ == '__main__':
     conf_file, options = parse_options()
-    sys.exit(run_wsgi(conf_file, 'object-server',
-                      global_conf_callback=server.global_conf_callback,
-                      **options))
+
+    # Load configuration, Set logger and Load request processor
+    try:
+        conf = appconfig(conf_file, name='object-server')
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
+    server_per_disk = config_true_value(conf.get('server_per_disk', 'no'))
+    runner = run_wsgi_one_server_per_disk if server_per_disk else run_wsgi
+
+    sys.exit(runner(conf_file, 'object-server',
+                    global_conf_callback=server.global_conf_callback,
+                    **options))
