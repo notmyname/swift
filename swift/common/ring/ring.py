@@ -44,9 +44,12 @@ class RingData(object):
                 dev.setdefault("region", 1)
 
     @classmethod
-    def deserialize_v1(cls, gz_file):
+    def deserialize_v1(cls, gz_file, header_only=False):
         json_len, = struct.unpack('!I', gz_file.read(4))
         ring_dict = json.loads(gz_file.read(json_len))
+        if header_only:
+            return ring_dict
+
         ring_dict['replica2part2dev_id'] = []
         partition_count = 1 << (32 - ring_dict['part_shift'])
         for x in xrange(ring_dict['replica_count']):
@@ -55,12 +58,14 @@ class RingData(object):
         return ring_dict
 
     @classmethod
-    def load(cls, filename):
+    def gzopen_and_get_version(cls, filename):
         """
-        Load ring data from a file.
+        Open a GzipFile, extract the ring serialization format ('pickle' or
+        'R1NG') and version (will be None for 'pickle' or an integer for newer
+        'R1NG' format).
 
         :param filename: Path to a file serialized by the save() method.
-        :returns: A RingData instance containing the loaded data.
+        :returns: A GzipFile instance, format, and version tuple.
         """
         gz_file = GzipFile(filename, 'rb')
         # Python 2.6 GzipFile doesn't support BufferedIO
@@ -71,14 +76,56 @@ class RingData(object):
         magic = gz_file.read(4)
         if magic == 'R1NG':
             version, = struct.unpack('!H', gz_file.read(2))
-            if version == 1:
-                ring_data = cls.deserialize_v1(gz_file)
-            else:
-                raise Exception('Unknown ring format version %d' % version)
+            return gz_file, magic, version
         else:
             # Assume old-style pickled ring
             gz_file.seek(0)
+            return gz_file, 'pickle', None
+
+    @classmethod
+    def load_devices(cls, filename):
+        """
+        Load only ring device data from a file.
+
+        :param filename: Path to a file serialized by the save() method.
+        :returns: A list of ring data (may have "holes" of None values)
+        """
+        gz_file, ring_format, format_version = cls.gzopen_and_get_version(
+            filename)
+
+        if ring_format == 'R1NG':
+            if format_version == 1:
+                ring_data = cls.deserialize_v1(gz_file, header_only=True)
+                return ring_data['devs']
+            else:
+                raise Exception('Unknown ring format version %d' %
+                                format_version)
+        else:
             ring_data = pickle.load(gz_file)
+            if not hasattr(ring_data, 'devs'):
+                return ring_data['devs']
+            return ring_data.devs
+
+    @classmethod
+    def load(cls, filename):
+        """
+        Load ring data from a file.
+
+        :param filename: Path to a file serialized by the save() method.
+        :returns: A RingData instance containing the loaded data.
+        """
+        gz_file, ring_format, format_version = cls.gzopen_and_get_version(
+            filename)
+
+        if ring_format == 'R1NG':
+            if format_version == 1:
+                ring_data = cls.deserialize_v1(gz_file)
+            else:
+                raise Exception('Unknown ring format version %d' %
+                                format_version)
+        else:
+            ring_data = pickle.load(gz_file)
+
         if not hasattr(ring_data, 'devs'):
             ring_data = RingData(ring_data['replica2part2dev_id'],
                                  ring_data['devs'], ring_data['part_shift'])
