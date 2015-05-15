@@ -14,14 +14,212 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from eventlet import greenio, sleep
+import os
+import signal
 import sys
-from swift.common.utils import parse_options
-from swift.common.wsgi import run_wsgi
+from swift.common import utils
+from swift.common.storage_policy import all_bind_ports_for_node
+from swift.common.utils import (
+    parse_options, capture_stdio, drop_privileges, whataremyips)
+from swift.common.wsgi import (
+    run_wsgi, get_socket, loadapp, run_server, appconfig, ConfigFileError,
+    _initrp)
 from swift.obj import server
+import time
+
+
+def run_wsgi_servers_per_port(conf_path, app_section, servers_per_port,
+                              *args, **kwargs):
+    """
+    Runs the object-server using one or more child worker processes per unique
+    device port across all storage polices' rings.
+
+    :param conf_path: Path to paste.deploy style configuration file/directory
+    :param app_section: App name from conf file to load config from
+    :param servers_per_port: How many workers per port (disk) to run
+    :returns: 0 if successful, nonzero otherwise
+    """
+    # Load configuration, set logger and Load request processor
+    try:
+        (conf, logger, log_name) = \
+            _initrp(conf_path, app_section, *args, **kwargs)
+    except ConfigFileError as e:
+        print(e)
+        return 1
+
+    # The normal run_wsgi drops privileges here, which we obviously cannot do
+    # if we want to support binding to low ports.  But we do want some of the
+    # actions that drop_privileges did.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    os.chdir('/')   # in case you need to rmdir on where you started the daemon
+    os.umask(0o22)  # ensure files are created with the correct privileges
+
+    # Ensure the configuration and application can be loaded before proceeding.
+    global_conf = {'log_name': log_name}
+    if 'global_conf_callback' in kwargs:
+        kwargs['global_conf_callback'](conf, global_conf)
+    loadapp(conf_path, global_conf=global_conf)
+
+    # set utils.FALLOCATE_RESERVE if desired
+    reserve = int(conf.get('fallocate_reserve', 0))
+    if reserve > 0:
+        utils.FALLOCATE_RESERVE = reserve
+    # redirect errors to logger and close stdio
+    capture_stdio(logger)
+
+    def kill_children(*args):
+        """Kills the entire process group."""
+        logger.error('SIGTERM received')
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        running[0] = False
+        os.killpg(0, signal.SIGTERM)
+
+    def hup(*args):
+        """Shuts down the server, but allows running requests to complete"""
+        logger.error('SIGHUP received')
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        running[0] = False
+
+    running = [True]
+    signal.signal(signal.SIGTERM, kill_children)
+    signal.signal(signal.SIGHUP, hup)
+
+    swift_dir = conf.get('swift_dir', '/etc/swift')
+    bind_ip = conf.get('bind_ip', '0.0.0.0')
+    ring_check_interval = int(conf.get('ring_check_interval', 15))
+    rtime = 0
+    my_ips = whataremyips(bind_ip)
+    mtimes_by_ring_name = {}
+    pids_by_port_index_pairs = {}
+    port_index_pairs_by_pid = {}
+    socks_by_port = {}
+    desired_port_index_pairs = None
+
+    while running[0]:
+        now = time.time()
+        if now >= rtime:
+            new_bind_ports = all_bind_ports_for_node(swift_dir, my_ips,
+                                                     mtimes_by_ring_name)
+            if new_bind_ports is not None:
+                desired_port_index_pairs = set(
+                    (p, i) for p in new_bind_ports
+                    for i in xrange(servers_per_port))
+            rtime = now + ring_check_interval
+
+        current_port_index_pairs = set(pids_by_port_index_pairs.keys())
+        if desired_port_index_pairs != current_port_index_pairs:
+            # Orphan ports are ports which had object-server processes running,
+            # but which no longer appear in the ring.  We'll kill them after we
+            # start missing workers.
+            orphan_port_index_pairs = current_port_index_pairs - \
+                desired_port_index_pairs
+
+            # Fork off worker(s) for every port who's supposed to have
+            # worker(s) but doesn't
+            missing_port_index_pairs = desired_port_index_pairs - \
+                current_port_index_pairs
+            for port, server_idx in sorted(missing_port_index_pairs):
+                if port not in socks_by_port:
+                    conf['bind_port'] = port
+                    socks_by_port[port] = get_socket(conf)
+
+                pid = os.fork()
+                if pid == 0:
+                    # child worker process
+                    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+                    # remaining tasks should not require elevated
+                    # privileges
+                    drop_privileges(conf.get('user', 'swift'),
+                                    no_setsid=True)
+                    try:
+                        run_server(conf, logger, socks_by_port[port])
+                        logger.notice('Child %d (PID %d, port %d) exiting '
+                                      'normally',
+                                      server_idx, os.getpid(), port)
+                    except Exception:
+                        logger.exception('Child %d (PID %d, port %d) '
+                                         'hit unhandled exception',
+                                         server_idx, os.getpid(), port)
+                        return 1
+                    return 0
+
+                logger.notice('Started child %d (PID %d) for port %d',
+                              server_idx, pid, port)
+                pids_by_port_index_pairs[(port, server_idx)] = pid
+                port_index_pairs_by_pid[pid] = (port, server_idx)
+
+            for orphan_pair in orphan_port_index_pairs:
+                # For any port in orphan_port_index_pairs, it is guaranteed
+                # that there should be no listen socket for that port, so we
+                # can close and forget them.
+                orphan_sock = socks_by_port.pop(orphan_pair[0], None)
+                if orphan_sock:
+                    greenio.shutdown_safe(orphan_sock)
+                    orphan_sock.close()
+                    logger.notice('Closing unnecessary sock for port %d',
+                                  orphan_pair[0])
+
+                orphan_pid = pids_by_port_index_pairs.pop(orphan_pair, None)
+                if orphan_pid:
+                    try:
+                        os.kill(orphan_pid, signal.SIGTERM)
+                    except OSError:
+                        continue
+            assert desired_port_index_pairs == \
+                set(pids_by_port_index_pairs.keys())
+
+        # Now, we need to notice when a child process dies OR when any ring
+        # mtime changes.  To achieve this, we check for either every so often
+        # (period chosen for acceptable child-restart latency and "busy wait"
+        # CPU usage).
+        sleep(0.5)
+
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except OSError:
+                break
+            if not pid:
+                break
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                dead_port, server_idx = port_index_pairs_by_pid[pid]
+                logger.error('Removing dead child %d (PID: %s) for port %s',
+                             server_idx, pid, dead_port)
+                del port_index_pairs_by_pid[pid]
+                pids_by_port_index_pairs.pop((dead_port, server_idx), None)
+
+    # Fell out of main loop; close all listen sockets and exit.
+    for sock in socks_by_port.values():
+        greenio.shutdown_safe(sock)
+        sock.close()
+
+    logger.notice('Exited')
+    return 0
 
 
 if __name__ == '__main__':
     conf_file, options = parse_options()
-    sys.exit(run_wsgi(conf_file, 'object-server',
-                      global_conf_callback=server.global_conf_callback,
-                      **options))
+
+    # Load configuration, Set logger and Load request processor
+    try:
+        conf = appconfig(conf_file, name='object-server')
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
+    runner = run_wsgi
+
+    servers_per_port = int(conf.get('servers_per_port', '0'))
+    if servers_per_port:
+        runner = run_wsgi_servers_per_port
+        options['servers_per_port'] = servers_per_port
+
+    sys.exit(runner(conf_file, 'object-server',
+                    global_conf_callback=server.global_conf_callback,
+                    **options))

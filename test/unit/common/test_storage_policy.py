@@ -15,14 +15,16 @@
 import unittest
 import StringIO
 from ConfigParser import ConfigParser
+import os
 import mock
+from functools import partial
 from tempfile import NamedTemporaryFile
-from test.unit import patch_policies, FakeRing
+from test.unit import patch_policies, FakeRing, temptree
 from swift.common.storage_policy import (
     StoragePolicyCollection, POLICIES, PolicyError, parse_storage_policies,
     reload_storage_policies, get_policy_string, split_policy_string,
     BaseStoragePolicy, StoragePolicy, ECStoragePolicy, REPL_POLICY, EC_POLICY,
-    VALID_EC_TYPES, DEFAULT_EC_OBJECT_SEGMENT_SIZE)
+    VALID_EC_TYPES, DEFAULT_EC_OBJECT_SEGMENT_SIZE, all_bind_ports_for_node)
 from swift.common.exceptions import RingValidationError
 
 
@@ -739,6 +741,95 @@ class TestStoragePolicies(unittest.TestCase):
         # bad policy index
         self.assertRaises(PolicyError, policies.get_object_ring, 99,
                           '/path/not/used')
+
+    def test_all_bind_ports_for_node(self):
+        test_policies = [StoragePolicy(0, 'aay', True),
+                         StoragePolicy(1, 'bee', False),
+                         StoragePolicy(2, 'cee', False)]
+
+        my_ips = ['1.2.3.4', '2.3.4.5']
+        other_ips = ['3.4.5.6', '4.5.6.7']
+        devs_by_ring_name1 = {
+            'object': [  # 'aay'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
+                 'port': 6006},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6007},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6008},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6009}],
+            'object-1': [  # 'bee'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6006},  # dupe
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6010},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6011},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6012}],
+            'object-2': [  # 'cee'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
+                 'port': 6010},  # on our IP and a not-us IP
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6013},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6014},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6015}],
+        }
+        devs_by_ring_name2 = {
+            'object': [  # 'aay'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
+                 'port': 6016},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6019}],
+            'object-1': [  # 'bee'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6016},  # dupe
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6022}],
+            'object-2': [  # 'cee'
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
+                 'port': 6020},
+                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6025}],
+        }
+        ring_files = [ring_name + '.ring.gz'
+                      for ring_name in devs_by_ring_name1]
+
+        def _fake_load_devices(gz_path, stub_objs):
+            return stub_objs[os.path.basename(gz_path)[:-8]]
+
+        with mock.patch(
+            'swift.common.storage_policy.RingData.load_devices'
+        ) as mock_ld:
+            with patch_policies(test_policies):
+                with temptree(ring_files) as tempdir:
+                    mock_ld.side_effect = partial(_fake_load_devices,
+                                                  stub_objs=devs_by_ring_name1)
+                    mtimes_cache = {}
+                    self.assertEqual(set([
+                        6006, 6008, 6011, 6010, 6014,
+                    ]), all_bind_ports_for_node(tempdir, my_ips, mtimes_cache))
+
+                    # mtime cache will keep the rings from being loaded again
+                    # (None is returned in this case)
+                    mock_ld.side_effect = partial(_fake_load_devices,
+                                                  stub_objs=devs_by_ring_name2)
+                    self.assertEqual(
+                        None,
+                        all_bind_ports_for_node(tempdir, my_ips, mtimes_cache))
+
+                    # but when all the file mtimes are made different, it'll
+                    # reload
+                    for gz_file in [os.path.join(tempdir, n)
+                                    for n in ring_files]:
+                        os.utime(gz_file, (88, 88))
+
+                    self.assertEqual(set([
+                        6016, 6020,
+                    ]), all_bind_ports_for_node(tempdir, my_ips, mtimes_cache))
 
     def test_singleton_passthrough(self):
         test_policies = [StoragePolicy(0, 'aay', True),
