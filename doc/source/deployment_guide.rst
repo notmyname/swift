@@ -139,6 +139,39 @@ swift-ring-builder with no options will display help text with available
 commands and options. More information on how the ring works internally
 can be found in the :doc:`Ring Overview <overview_ring>`.
 
+.. _server-per-port-configuration:
+
+-------------------------------
+Running object-servers Per Disk
+-------------------------------
+
+The lack of true asynchronous file I/O on Linux leaves the object-server
+workers vulnerable to misbehaving disks.  Because any object-server worker can
+service a request for any disk, and a slow I/O request blocks the eventlet hub,
+a single slow disk can impair an entire storage node.  This also prevents
+object servers from fully utilizing all their disks during heavy load.
+
+The :ref:`threads_per_disk <object-server-options>` option is one way to
+address this, but it comes with severe performance overhead which is worse
+than the benefit of I/O isolation.
+
+Another way to get full I/O isolation is to give each disk on a storage node a
+different port in the storage policy rings.  Then set the
+:ref:`servers_per_port <object-server-default-options>`
+option in the object-server config.  NOTE: while the purpose of this config
+setting is to run one or more object-server worker processes per *disk*, the
+implementation just runs object-servers per unique port of local devices in the
+rings.  The deployer must combine this option with appropriately-configured
+rings to benefit from this feature.
+
+If you do not run a separate object-server for replication, then this setting
+must be available to the object-replicator and object-reconstructor (i.e.
+appear in the [DEFAULT] config section).  If you do run a separate
+object-server for replication, then you have the option of also using
+`servers_per_port` for replication or to run replication "normally" with each
+ring's device having a single replication_port value but different port
+values.
+
 .. _general-service-configuration:
 
 -----------------------------
@@ -149,14 +182,14 @@ Most Swift services fall into two categories.  Swift's wsgi servers and
 background daemons.
 
 For more information specific to the configuration of Swift's wsgi servers
-with paste deploy see :ref:`general-server-configuration`
+with paste deploy see :ref:`general-server-configuration`.
 
 Configuration for servers and daemons can be expressed together in the same
 file for each type of server, or separately.  If a required section for the
 service trying to start is missing there will be an error.  The sections not
 used by the service are ignored.
 
-Consider the example of an object storage node.  By convention configuration
+Consider the example of an object storage node.  By convention, configuration
 for the object-server, object-updater, object-replicator, and object-auditor
 exist in a single file ``/etc/swift/object-server.conf``::
 
@@ -323,7 +356,7 @@ max_header_size      8192        max_header_size is the max number of bytes in
                                  tokens including more than 7 catalog entries.
                                  See also include_service_catalog in
                                  proxy-server.conf-sample (documented in
-                                 overview_auth.rst)
+                                 overview_auth.rst).
 ===================  ==========  =============================================
 
 ---------------------------
@@ -334,6 +367,8 @@ An Example Object Server configuration can be found at
 etc/object-server.conf-sample in the source code repository.
 
 The following configuration options are available:
+
+.. _object-server-default-options:
 
 [DEFAULT]
 
@@ -353,12 +388,31 @@ workers              auto        Override the number of pre-forked workers
                                  should be an integer, zero means no fork.  If
                                  unset, it will try to default to the number
                                  of effective cpu cores and fallback to one.
-                                 Increasing the number of workers may reduce
-                                 the possibility of slow file system
-                                 operations in one request from negatively
-                                 impacting other requests, but may not be as
-                                 efficient as tuning :ref:`threads_per_disk
-                                 <object-server-options>`
+                                 Increasing the number of workers helps slow
+                                 file system operations in one request from
+                                 negatively impacting other requests, but only
+                                 the :ref:`threads_per_disk
+                                 <object-server-options>` and
+                                 `servers_per_port` options provide complete
+                                 I/O isolation.
+servers_per_port     0           If each disk in each storage policy ring has
+                                 unique port numbers for its "ip" value, you
+                                 can use this setting to have each
+                                 object-server worker only service requests
+                                 for the single disk matching the port in the
+                                 ring.  The value of this setting determines
+                                 how many worker processes run for each port
+                                 (disk) in the ring.  If you have a 24 disks
+                                 per server, and this setting was 4, then
+                                 each storage node would have 1 + (24 * 4) =
+                                 97 total object-server processes running.
+                                 This gives complete I/O isolation like
+                                 :ref:`threads_per_disk <object-server-options>`,
+                                 but with less overhead.  The
+                                 object-replicator and object-reconstructor
+                                 need to see this setting too, so it must be
+                                 in the [DEFAULT] section.
+                                 See :ref:`server-per-port-configuration`.
 max_clients          1024        Maximum number of clients one worker can
                                  process simultaneously (it will actually
                                  accept(2) N + 1). Setting this to one (1)
@@ -562,7 +616,7 @@ workers              auto        Override the number of pre-forked workers
                                  the possibility of slow file system
                                  operations in one request from negatively
                                  impacting other requests.  See
-                                 :ref:`general-service-tuning`
+                                 :ref:`general-service-tuning`.
 max_clients          1024        Maximum number of clients one worker can
                                  process simultaneously (it will actually
                                  accept(2) N + 1). Setting this to one (1)
@@ -690,7 +744,7 @@ workers              auto        Override the number of pre-forked workers
                                  the possibility of slow file system
                                  operations in one request from negatively
                                  impacting other requests.  See
-                                 :ref:`general-service-tuning`
+                                 :ref:`general-service-tuning`.
 max_clients          1024        Maximum number of clients one worker can
                                  process simultaneously (it will actually
                                  accept(2) N + 1). Setting this to one (1)
@@ -813,7 +867,7 @@ workers                       auto             Override the number of
                                                will try to default to the
                                                number of effective cpu cores
                                                and fallback to one.  See
-                                               :ref:`general-service-tuning`
+                                               :ref:`general-service-tuning`.
 max_clients                   1024             Maximum number of clients one
                                                worker can process
                                                simultaneously (it will

@@ -437,7 +437,7 @@ def run_server(conf, logger, sock, global_conf=None):
     pool.waitall()
 
 
-#TODO(clayg): pull more pieces of this to test more
+# TODO(clayg): pull more pieces of this to test more
 def run_wsgi(conf_path, app_section, *args, **kwargs):
     """
     Runs the server using the specified number of workers.
