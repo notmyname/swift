@@ -119,6 +119,7 @@ class ObjectReconstructor(Daemon):
         self.devices_dir = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
+        self.bind_ip = conf.get('bind_ip', '0.0.0.0')
         self.port = int(conf.get('bind_port', 6000))
         self.concurrency = int(conf.get('concurrency', 1))
         self.stats_interval = int(conf.get('stats_interval', '300'))
@@ -760,7 +761,7 @@ class ObjectReconstructor(Daemon):
         """
         override_devices = override_devices or []
         override_partitions = override_partitions or []
-        ips = whataremyips()
+        ips = whataremyips(self.bind_ip)
         for policy in POLICIES:
             if policy.policy_type != EC_POLICY:
                 continue

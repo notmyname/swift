@@ -78,11 +78,6 @@ def make_ec_archive_bodies(policy, test_body):
     return ec_archive_bodies
 
 
-def _ips():
-    return ['127.0.0.1']
-object_reconstructor.whataremyips = _ips
-
-
 def _create_test_rings(path):
     testgz = os.path.join(path, 'object.ring.gz')
     intended_replica2part2dev_id = [
@@ -1009,6 +1004,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.conf = {
             'devices': self.devices,
             'mount_check': False,
+            'bind_ip': self.ip,
             'bind_port': self.port,
         }
         self.logger = debug_logger('object-reconstructor')
@@ -1038,9 +1034,7 @@ class TestObjectReconstructor(unittest.TestCase):
                 utils.mkdirs(os.path.join(
                     self.devices, self.local_dev['device'],
                     datadir, str(part)))
-        with mock.patch('swift.obj.reconstructor.whataremyips',
-                        return_value=[self.ip]):
-            part_infos = list(self.reconstructor.collect_parts())
+        part_infos = list(self.reconstructor.collect_parts())
         found_parts = sorted(int(p['partition']) for p in part_infos)
         self.assertEqual(found_parts, sorted(stub_parts))
         for part_info in part_infos:
@@ -1073,6 +1067,7 @@ class TestObjectReconstructor(unittest.TestCase):
             'replication_ip': self.ip,
             'replication_port': self.port
         } for dev in local_devs]
+        self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
         with nested(mock.patch('swift.obj.reconstructor.whataremyips',
                                return_value=[self.ip]),
                     mock.patch.object(self.policy.object_ring, '_devs',

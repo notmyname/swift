@@ -65,6 +65,7 @@ class ObjectReplicator(Daemon):
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
+        self.bind_ip = conf.get('bind_ip', '0.0.0.0')
         self.port = int(conf.get('bind_port', 6000))
         self.concurrency = int(conf.get('concurrency', 1))
         self.stats_interval = int(conf.get('stats_interval', '300'))
@@ -538,7 +539,7 @@ class ObjectReplicator(Daemon):
             policies will be returned
         """
         jobs = []
-        ips = whataremyips()
+        ips = whataremyips(self.bind_ip)
         for policy in POLICIES:
             if policy.policy_type == REPL_POLICY:
                 if (override_policies is not None and

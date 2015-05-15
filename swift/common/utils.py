@@ -1705,12 +1705,26 @@ def expand_ipv6(address):
     return socket.inet_ntop(socket.AF_INET6, packed_ip)
 
 
-def whataremyips():
+def whataremyips(bind_ip=None):
     """
-    Get the machine's ip addresses
+    Get the machine's ip addresses.  If a bind_ip is passed in and is not
+    '0.0.0.0', '0000:0000:0000:0000:0000:0000:0000:0000', or '::', then only
+    the passed in bind_ip is returned in the list.  Otherwise, all IP addresses
+    are returned in a list.
 
     :returns: list of Strings of ip addresses
     """
+    if bind_ip:
+        # See if bind_ip is '0.0.0.0'/'::'
+        try:
+            _, _, _, _, sockaddr = socket.getaddrinfo(
+                bind_ip, None, 0, socket.SOCK_STREAM, 0,
+                socket.AI_NUMERICHOST)[0]
+            if sockaddr[0] not in ('0.0.0.0', '::'):
+                return [bind_ip]
+        except socket.gaierror:
+            pass
+
     addresses = []
     for interface in netifaces.interfaces():
         try:

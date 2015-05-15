@@ -36,9 +36,8 @@ from swift.obj import diskfile, replicator as object_replicator
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
-def _ips():
+def _ips(*args, **kwargs):
     return ['127.0.0.0']
-object_replicator.whataremyips = _ips
 
 
 def mock_http_connect(status):
@@ -187,6 +186,7 @@ class TestObjectReplicator(unittest.TestCase):
             os.mkdir(self.parts_1[part])
         _create_test_rings(self.testdir)
         self.conf = dict(
+            bind_ip=_ips()[0],
             swift_dir=self.testdir, devices=self.devices, mount_check='false',
             timeout='300', stats_interval='1', sync_method='rsync')
         self.replicator = object_replicator.ObjectReplicator(self.conf)
@@ -199,6 +199,7 @@ class TestObjectReplicator(unittest.TestCase):
 
     def test_run_once(self):
         conf = dict(swift_dir=self.testdir, devices=self.devices,
+                    bind_ip=_ips()[0],
                     mount_check='false', timeout='300', stats_interval='1')
         replicator = object_replicator.ObjectReplicator(conf)
         was_connector = object_replicator.http_connect
@@ -260,7 +261,9 @@ class TestObjectReplicator(unittest.TestCase):
             process_arg_checker.append(
                 (0, '', ['rsync', whole_path_from, rsync_mods]))
         with _mock_process(process_arg_checker):
-            replicator.run_once()
+            with mock.patch('swift.obj.replicator.whataremyips',
+                            side_effect=_ips):
+                replicator.run_once()
         self.assertFalse(process_errors)
         object_replicator.http_connect = was_connector
 
@@ -929,6 +932,7 @@ class TestObjectReplicator(unittest.TestCase):
 
     def test_run_once_recover_from_failure(self):
         conf = dict(swift_dir=self.testdir, devices=self.devices,
+                    bind_ip=_ips()[0],
                     mount_check='false', timeout='300', stats_interval='1')
         replicator = object_replicator.ObjectReplicator(conf)
         was_connector = object_replicator.http_connect
@@ -975,6 +979,7 @@ class TestObjectReplicator(unittest.TestCase):
 
     def test_run_once_recover_from_timeout(self):
         conf = dict(swift_dir=self.testdir, devices=self.devices,
+                    bind_ips=_ips()[0],
                     mount_check='false', timeout='300', stats_interval='1')
         replicator = object_replicator.ObjectReplicator(conf)
         was_connector = object_replicator.http_connect

@@ -39,8 +39,8 @@ for p in POLICIES:
     POLICIES_BY_TYPE[p.policy_type].append(p)
 
 
-def get_server_number(port, port2server):
-    server_number = port2server[port]
+def get_server_number(ipport, ipport2server):
+    server_number = ipport2server[ipport]
     server, number = server_number[:-1], server_number[-1:]
     try:
         number = int(number)
@@ -50,19 +50,19 @@ def get_server_number(port, port2server):
     return server, number
 
 
-def start_server(port, port2server, pids, check=True):
-    server, number = get_server_number(port, port2server)
+def start_server(ipport, ipport2server, pids, check=True):
+    server, number = get_server_number(ipport, ipport2server)
     err = Manager([server]).start(number=number, wait=False)
     if err:
         raise Exception('unable to start %s' % (
             server if not number else '%s%s' % (server, number)))
     if check:
-        return check_server(port, port2server, pids)
+        return check_server(ipport, ipport2server, pids)
     return None
 
 
-def check_server(port, port2server, pids, timeout=CHECK_SERVER_TIMEOUT):
-    server = port2server[port]
+def check_server(ipport, ipport2server, pids, timeout=CHECK_SERVER_TIMEOUT):
+    server = ipport2server[ipport]
     if server[:-1] in ('account', 'container', 'object'):
         if int(server[-1]) > 4:
             return None
@@ -74,7 +74,7 @@ def check_server(port, port2server, pids, timeout=CHECK_SERVER_TIMEOUT):
         try_until = time() + timeout
         while True:
             try:
-                conn = HTTPConnection('127.0.0.1', port)
+                conn = HTTPConnection(*ipport)
                 conn.request('GET', path)
                 resp = conn.getresponse()
                 # 404 because it's a nonsense path (and mount_check is false)
@@ -87,14 +87,14 @@ def check_server(port, port2server, pids, timeout=CHECK_SERVER_TIMEOUT):
                 if time() > try_until:
                     print err
                     print 'Giving up on %s:%s after %s seconds.' % (
-                        server, port, timeout)
+                        server, ipport, timeout)
                     raise err
                 sleep(0.1)
     else:
         try_until = time() + timeout
         while True:
             try:
-                url, token = get_auth('http://127.0.0.1:8080/auth/v1.0',
+                url, token = get_auth('http://%s:%d/auth/v1.0' % ipport,
                                       'test:tester', 'testing')
                 account = url.split('/')[-1]
                 head_account(url, token)
@@ -108,8 +108,8 @@ def check_server(port, port2server, pids, timeout=CHECK_SERVER_TIMEOUT):
     return None
 
 
-def kill_server(port, port2server, pids):
-    server, number = get_server_number(port, port2server)
+def kill_server(ipport, ipport2server, pids):
+    server, number = get_server_number(ipport, ipport2server)
     err = Manager([server]).kill(number=number)
     if err:
         raise Exception('unable to kill %s' % (server if not number else
@@ -117,29 +117,29 @@ def kill_server(port, port2server, pids):
     try_until = time() + 30
     while True:
         try:
-            conn = HTTPConnection('127.0.0.1', port)
+            conn = HTTPConnection(*ipport)
             conn.request('GET', '/')
             conn.getresponse()
         except Exception as err:
             break
         if time() > try_until:
             raise Exception(
-                'Still answering on port %s after 30 seconds' % port)
+                'Still answering on %s:%s after 30 seconds' % ipport)
         sleep(0.1)
 
 
-def kill_nonprimary_server(primary_nodes, port2server, pids):
-    primary_ports = [n['port'] for n in primary_nodes]
-    for port, server in port2server.iteritems():
-        if port in primary_ports:
+def kill_nonprimary_server(primary_nodes, ipport2server, pids):
+    primary_ipports = [(n['ip'], n['port']) for n in primary_nodes]
+    for ipport, server in ipport2server.iteritems():
+        if ipport in primary_ipports:
             server_type = server[:-1]
             break
     else:
         raise Exception('Cannot figure out server type for %r' % primary_nodes)
-    for port, server in list(port2server.iteritems()):
-        if server[:-1] == server_type and port not in primary_ports:
-            kill_server(port, port2server, pids)
-            return port
+    for ipport, server in list(ipport2server.iteritems()):
+        if server[:-1] == server_type and ipport not in primary_ipports:
+            kill_server(ipport, ipport2server, pids)
+            return ipport
 
 
 def build_port_to_conf(server):
@@ -235,32 +235,32 @@ class ProbeTest(unittest.TestCase):
         Manager(['all']).stop()
         self.pids = {}
         try:
+            self.ipport2server = {}
             self.account_ring = get_ring(
                 'account',
                 self.acct_cont_required_replicas,
                 self.acct_cont_required_devices)
+            self._add_ring_devs_to_ipport2server(self.account_ring, 'account')
             self.container_ring = get_ring(
                 'container',
                 self.acct_cont_required_replicas,
                 self.acct_cont_required_devices)
+            self._add_ring_devs_to_ipport2server(self.container_ring,
+                                                 'container')
             self.policy = get_policy(**self.policy_requirements)
             self.object_ring = get_ring(
                 self.policy.ring_name,
                 self.obj_required_replicas,
                 self.obj_required_devices,
                 server='object')
+            self._add_ring_devs_to_ipport2server(self.object_ring, 'object')
             Manager(['main']).start(wait=False)
-            self.port2server = {}
-            for server, port in [('account', 6002), ('container', 6001),
-                                 ('object', 6000)]:
-                for number in xrange(1, 9):
-                    self.port2server[port + (number * 10)] = \
-                        '%s%d' % (server, number)
-            for port in self.port2server:
-                check_server(port, self.port2server, self.pids)
-            self.port2server[8080] = 'proxy'
-            self.url, self.token, self.account = \
-                check_server(8080, self.port2server, self.pids)
+            for ipport in self.ipport2server:
+                check_server(ipport, self.ipport2server, self.pids)
+            proxy_ipport = ('127.0.0.1', 8080)
+            self.ipport2server[proxy_ipport] = 'proxy'
+            self.url, self.token, self.account = check_server(
+                proxy_ipport, self.ipport2server, self.pids)
             self.configs = defaultdict(dict)
             for name in ('account', 'container', 'object'):
                 for server_name in (name, '%s-replicator' % name):
@@ -287,6 +287,19 @@ class ProbeTest(unittest.TestCase):
     def tearDown(self):
         Manager(['all']).kill()
 
+    def _add_ring_devs_to_ipport2server(self, ring, server_type):
+        # We'll number the servers by order of unique occurrence of (ip, port)
+        # tuples within the ring devices.
+        ipports_to_number = {}
+        number = 0
+        for dev in filter(None, ring.devs):
+            ipport = (dev['ip'], dev['port'])
+            if ipport not in ipports_to_number:
+                number += 1
+                ipports_to_number[ipport] = number
+            self.ipport2server[ipport] = '%s%d' % (server_type,
+                                                   ipports_to_number[ipport])
+
     def device_dir(self, server, node):
         conf = self.server_port_to_conf[server][node['port']]
         return os.path.join(conf['devices'], node['device'])
@@ -301,7 +314,7 @@ class ProbeTest(unittest.TestCase):
 
     def config_number(self, node):
         _server_type, config_number = get_server_number(
-            node['port'], self.port2server)
+            (node['ip'], node['port']), self.ipport2server)
         return config_number
 
     def get_to_final_state(self):

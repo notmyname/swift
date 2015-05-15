@@ -1488,6 +1488,18 @@ class TestUtils(unittest.TestCase):
         self.assert_(len(myips) > 1)
         self.assert_('127.0.0.1' in myips)
 
+    def test_whataremyips_bind_to_all(self):
+        for any_addr in ('0.0.0.0', '0000:0000:0000:0000:0000:0000:0000:0000',
+                         '::0', '::0000', '::',
+                         # Wacky parse-error input produces all IPs
+                         'I am a bear'):
+            myips = utils.whataremyips(any_addr)
+            self.assert_(len(myips) > 1)
+            self.assert_('127.0.0.1' in myips)
+
+    def test_whataremyips_bind_ip_specific(self):
+        self.assertEqual(['1.2.3.4'], utils.whataremyips('1.2.3.4'))
+
     def test_whataremyips_error(self):
         def my_interfaces():
             return ['eth0']
