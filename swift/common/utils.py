@@ -1329,6 +1329,7 @@ class LogAdapter(logging.LoggerAdapter, object):
     def __init__(self, logger, server):
         logging.LoggerAdapter.__init__(self, logger, {})
         self.server = server
+        setattr(self, 'warn', self.warning)
 
     @property
     def txn_id(self):
