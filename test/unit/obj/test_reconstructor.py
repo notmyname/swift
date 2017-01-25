@@ -719,7 +719,6 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         rmtree(testring, ignore_errors=1)
 
     def test_build_reconstruction_jobs(self):
-        self.reconstructor.handoffs_first = False
         self.reconstructor._reset_stats()
         for part_info in self.reconstructor.collect_parts():
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
@@ -728,13 +727,40 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                              object_reconstructor.REVERT))
             self.assert_expected_jobs(part_info['partition'], jobs)
 
+    def test_handoffs_first(self):
         self.reconstructor.handoffs_first = True
-        self.reconstructor._reset_stats()
-        for part_info in self.reconstructor.collect_parts():
-            jobs = self.reconstructor.build_reconstruction_jobs(part_info)
-            self.assertTrue(jobs[0]['job_type'] ==
-                            object_reconstructor.REVERT)
-            self.assert_expected_jobs(part_info['partition'], jobs)
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # increment failure counter
+            self.reconstructor.handoffs_remaining += 1
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # but failures keep handoffs remaining
+        msgs = self.reconstructor.logger.get_lines_for_level('info')
+        self.assertIn('Next pass will only revert handoffs', msgs[-1])
+        self.logger._clear()
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # success does not increment failure counter
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs ... but all handoffs cleared out successfully
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # it's time to turn off handoffs_first
+        msgs = self.reconstructor.logger.get_lines_for_level('warning')
+        self.assertIn('You should disable handoffs first', msgs[-1])
 
     def test_get_partners(self):
         # we're going to perform an exhaustive test of every possible
@@ -2345,7 +2371,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
 
-    def test_process_job_revert_is_handoff(self):
+    def test_process_job_revert_is_handoff_fails(self):
         replicas = self.policy.object_ring.replicas
         frag_index = random.randint(0, replicas - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
@@ -2375,7 +2401,8 @@ class TestObjectReconstructor(unittest.TestCase):
 
         def ssync_response_callback(*args):
             # in this test ssync always fails, until we encounter ourselves in
-            # the list of possible handoff's to sync to
+            # the list of possible handoff's to sync to, so handoffs_remaining
+            # should increment
             return False, {}
 
         expected_suffix_calls = set([
@@ -2401,6 +2428,7 @@ class TestObjectReconstructor(unittest.TestCase):
         call = ssync_calls[0]
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
+        self.assertEqual(self.reconstructor.handoffs_remaining, 1)
 
     def test_process_job_revert_cleanup(self):
         replicas = self.policy.object_ring.replicas
@@ -2446,6 +2474,7 @@ class TestObjectReconstructor(unittest.TestCase):
         }
 
         def ssync_response_callback(*args):
+            # success should not increment handoffs_remaining
             return True, {ohash: {'ts_data': ts}}
 
         ssync_calls = []
@@ -2469,6 +2498,7 @@ class TestObjectReconstructor(unittest.TestCase):
         df_mgr.get_hashes(self.local_dev['device'], str(partition), [],
                           self.policy)
         self.assertFalse(os.access(df._datadir, os.F_OK))
+        self.assertEqual(self.reconstructor.handoffs_remaining, 0)
 
     def test_process_job_revert_cleanup_tombstone(self):
         sync_to = [random.choice([n for n in self.policy.object_ring.devs

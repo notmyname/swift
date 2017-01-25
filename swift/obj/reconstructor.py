@@ -656,6 +656,8 @@ class ObjectReconstructor(Daemon):
         if syncd_with >= len(job['sync_to']):
             self.delete_reverted_objs(
                 job, reverted_objs, job['frag_index'])
+        else:
+            self.handoffs_remaining += 1
         self.logger.timing_since('partition.delete.timing', begin)
 
     def _get_part_jobs(self, local_dev, part_path, partition, policy):
@@ -684,6 +686,9 @@ class ObjectReconstructor(Daemon):
         :param policy: the policy
 
         :returns: a list of dicts of job info
+
+        N.B. If this function ever returns an empty list of jobs the entire
+        partition will be deleted.
         """
         # find all the fi's in the part, and which suffixes have them
         try:
@@ -876,12 +881,12 @@ class ObjectReconstructor(Daemon):
         """
         Helper function for collect_jobs to build jobs for reconstruction
         using EC style storage policy
+
+        N.B. If this function ever returns an empty list of jobs the entire
+        partition will be deleted.
         """
         jobs = self._get_part_jobs(**part_info)
         random.shuffle(jobs)
-        if self.handoffs_first:
-            # Move the handoff revert jobs to the front of the list
-            jobs.sort(key=lambda job: job['job_type'], reverse=True)
         self.job_count += len(jobs)
         return jobs
 
@@ -897,6 +902,7 @@ class ObjectReconstructor(Daemon):
         self.reconstruction_part_count = 0
         self.reconstruction_device_count = 0
         self.last_reconstruction_count = -1
+        self.handoffs_remaining = 0
 
     def delete_partition(self, path):
         self.logger.info(_("Removing partition: %s"), path)
@@ -932,6 +938,11 @@ class ObjectReconstructor(Daemon):
                     self.run_pool.spawn(self.delete_partition,
                                         part_info['part_path'])
                 for job in jobs:
+                    if (self.handoffs_first and job['job_type'] != REVERT):
+                        self.logger.debug('Skipping %s job for %s '
+                                          'while in handoffs_first mode.',
+                                          job['job_type'], job['path'])
+                        continue
                     self.run_pool.spawn(self.process_job, job)
             with Timeout(self.lockup_timeout):
                 self.run_pool.waitall()
@@ -943,6 +954,15 @@ class ObjectReconstructor(Daemon):
             stats.kill()
             lockup_detector.kill()
             self.stats_line()
+        if self.handoffs_first:
+            if self.handoffs_remaining > 0:
+                self.logger.info(_(
+                    "Handoffs first mode still has handoffs remaining.  "
+                    "Next pass will only revert handoffs."))
+            else:
+                self.logger.warning(_(
+                    "Handoffs first mode found no handoffs remaining.  "
+                    "You should disable handoffs first immediately."))
 
     def run_once(self, *args, **kwargs):
         start = time.time()
