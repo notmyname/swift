@@ -1751,7 +1751,9 @@ sorting_method                shuffle          Storage nodes can be chosen at
                                                control. In both the timing and
                                                affinity cases, equally-sorting nodes
                                                are still randomly chosen to spread
-                                               load.
+                                               load. This option may be overridden
+                                               in a per-policy configuration
+                                               section.
 timing_expiry                 300              If the "timing" sorting_method is
                                                used, the timings will only be valid
                                                for the number of seconds configured
@@ -1807,14 +1809,18 @@ read_affinity                 None             Specifies which backend servers t
                                                equals is the priority to be given to
                                                the selection; lower numbers are
                                                higher priority. Default is empty,
-                                               meaning no preference.
+                                               meaning no preference. This option
+                                               may be overridden in a per-policy
+                                               configuration section.
 write_affinity                None             Specifies which backend servers to
                                                prefer on writes. Format is a comma
                                                separated list of affinity
                                                descriptors of the form r<N> for
                                                region N or r<N>z<M> for region N,
                                                zone M. Default is empty, meaning no
-                                               preference.
+                                               preference. This option may be
+                                               overridden in a per-policy
+                                               configuration section.
 write_affinity_node_count     2 * replicas     The number of local (as governed by
                                                the write_affinity setting) nodes to
                                                attempt to contact first on writes,
@@ -1823,8 +1829,46 @@ write_affinity_node_count     2 * replicas     The number of local (as governed 
                                                '* replicas' at the end to have it
                                                use the number given times the number
                                                of replicas for the ring being used
-                                               for the request.
+                                               for the request. This option may be
+                                               overridden in a per-policy
+                                               configuration section.
 ============================  ===============  =====================================
+
+Per policy configuration
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some proxy-server configuration options may be overridden on a per-policy
+basis by including per-policy config section(s). These options are::
+
+    sorting_method
+    read_affinity
+    write_affinity
+    write_affinity_node_count
+
+The section name must be of the form::
+
+    [proxy-server:policy:<policy index>]
+
+.. note::
+
+    The section name should refer to the policy index, not the policy name.
+
+The value of any option specified a per-policy section will override any value
+given in the proxy-server section for that policy only. Otherwise the value of
+these options will be that specified in the proxy-server section.
+
+For example, the following section provides policy specific options for a
+policy with index 3::
+
+    [proxy-server:policy:3]
+    sorting_method = affinity
+    read_affinity = r2=1
+    write_affinity = r2
+    write_affinity_node_count = 1 * replicas
+
+
+Tempauth
+^^^^^^^^
 
 [tempauth]
 

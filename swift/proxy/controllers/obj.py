@@ -129,7 +129,7 @@ class BaseObjectController(Controller):
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
 
-    def iter_nodes_local_first(self, ring, partition):
+    def iter_nodes_local_first(self, ring, partition, policy=None):
         """
         Yields nodes for a ring partition.
 
@@ -143,13 +143,13 @@ class BaseObjectController(Controller):
         :param ring: ring to get nodes from
         :param partition: ring partition to yield nodes for
         """
-
-        is_local = self.app.write_affinity_is_local_fn
+        policy_conf = self.app.get_conf(policy)
+        is_local = policy_conf.write_affinity_is_local_fn
         if is_local is None:
             return self.app.iter_nodes(ring, partition)
 
         primary_nodes = ring.get_part_nodes(partition)
-        num_locals = self.app.write_affinity_node_count(len(primary_nodes))
+        num_locals = policy_conf.write_affinity_node_count(len(primary_nodes))
 
         all_nodes = itertools.chain(primary_nodes,
                                     ring.get_more_nodes(partition))
